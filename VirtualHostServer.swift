@@ -53,6 +53,11 @@ class VirtualHostServer {
     private func handleRequest(clientSocket: Int32) {
         defer { close(clientSocket) }
 
+        // Set socket timeout to prevent hanging
+        var timeout = timeval(tv_sec: 10, tv_usec: 0)
+        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
         // Read HTTP request
         let bufferSize = 4096
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
@@ -74,8 +79,8 @@ class VirtualHostServer {
 
         display.log("Request: \(request.method) \(request.path) Host: \(hostname)", icon: "📥", fallback: "[REQ]")
 
-        // Look up service in mDNS registry
-        guard let service = serviceRegistry.lookupServiceForHostname(hostname) else {
+        // Look up service via mDNS (lazy discovery)
+        guard let service = discoverService(for: hostname) else {
             let response = HTTPResponse(status: "503 Service Unavailable",
                                        body: "Service not discovered: \(hostname)")
             sendResponse(response, to: clientSocket)
@@ -86,11 +91,11 @@ class VirtualHostServer {
         display.log("Routing \(hostname) → \(service.host):\(service.port)", icon: "🔀", fallback: "[ROUTE]")
 
         // Proxy request to the discovered service
-        let response = proxyRequest(request, to: service)
+        let response = proxyRequest(request, to: service, originalRequest: request)
         sendResponse(response, to: clientSocket)
     }
 
-    private func proxyRequest(_ request: HTTPRequest, to service: DiscoveredService) -> HTTPResponse {
+    private func proxyRequest(_ request: HTTPRequest, to service: DiscoveredService, originalRequest: HTTPRequest) -> HTTPResponse {
         // Create connection to backend service
         let backendSocket = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
         guard backendSocket >= 0 else {
@@ -121,8 +126,20 @@ class VirtualHostServer {
             return HTTPResponse(status: "502 Bad Gateway", body: "Backend connection failed")
         }
 
+        // Check if client is a browser
+        let userAgent = originalRequest.headers["User-Agent"] ?? ""
+        let isBrowser = userAgent.contains("Mozilla") || userAgent.contains("Chrome") || userAgent.contains("Safari")
+
+        // Modify request to ask for JSON if client is a browser and service supports it
+        var modifiedRequest = request
+        if isBrowser && service.capabilities["supports_json"] == "true" {
+            var headers = request.headers
+            headers["Accept"] = "application/json"
+            modifiedRequest = HTTPRequest(method: request.method, path: request.path, headers: headers, body: request.body)
+        }
+
         // Forward the request
-        let requestString = serializeHTTPRequest(request)
+        let requestString = serializeHTTPRequest(modifiedRequest)
         let requestData = requestString.data(using: .utf8) ?? Data()
         _ = requestData.withUnsafeBytes { bytes in
             send(backendSocket, bytes.bindMemory(to: UInt8.self).baseAddress, requestData.count, 0)
@@ -143,8 +160,106 @@ class VirtualHostServer {
             return HTTPResponse(status: "502 Bad Gateway", body: "Invalid response from backend")
         }
 
-        // Parse and return the response
-        return parseHTTPResponse(responseString)
+        // Parse the response
+        let parsedResponse = parseHTTPResponse(responseString)
+
+        // If browser and response is JSON, convert to HTML
+        if isBrowser && parsedResponse.headers["Content-Type"]?.contains("application/json") == true {
+            if let jsonBody = String(data: parsedResponse.body, encoding: .utf8) {
+                let htmlBody = convertJSONToHTML(jsonBody, cssEndpoint: service.capabilities["css_endpoint"])
+                return HTTPResponse(status: parsedResponse.status, contentType: "text/html", body: htmlBody)
+            }
+        }
+
+        return parsedResponse
+    }
+
+    private func convertJSONToHTML(_ jsonString: String, cssEndpoint: String?) -> String {
+        // Parse JSON
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let type = json["type"] as? String,
+              type == "directory_listing",
+              let path = json["path"] as? String,
+              let items = json["items"] as? [[String: Any]] else {
+            return "<html><body><h1>Error parsing JSON</h1></body></html>"
+        }
+
+        // Build HTML
+        var html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Directory: \(path)</title>
+        """
+
+        // Add CSS link if available (or default to /layout.css)
+        let cssPath = cssEndpoint ?? "/layout.css"
+        html += "\n    <link rel=\"stylesheet\" href=\"\(cssPath)\">"
+
+        html += """
+
+        </head>
+        <body>
+            <div class="directory-listing">
+                <div class="header">
+                    <h1>Directory Listing</h1>
+                    <div class="path">\(path)</div>
+                </div>
+                <div class="items">
+        """
+
+        // Convert each item to HTML
+        for item in items {
+            guard let name = item["name"] as? String,
+                  let type = item["type"] as? String,
+                  let itemPath = item["path"] as? String else {
+                continue
+            }
+
+            let isFolder = (type == "folder")
+            let iconClass = isFolder ? "folder-icon" : "file-icon"
+            let size = item["size"] as? Int ?? 0
+            let sizeStr = isFolder ? "" : formatFileSize(size)
+
+            html += """
+
+                    <a href="\(itemPath)">
+                        <div class="item">
+                            <div class="icon \(iconClass)"></div>
+                            <div class="item-info">
+                                <div class="item-name">\(name)</div>
+                                <div class="item-meta">\(type)</div>
+                            </div>
+                            <div class="item-size">\(sizeStr)</div>
+                        </div>
+                    </a>
+            """
+        }
+
+        html += """
+
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        return html
+    }
+
+    private func formatFileSize(_ bytes: Int) -> String {
+        if bytes < 1024 {
+            return "\(bytes) B"
+        } else if bytes < 1024 * 1024 {
+            return String(format: "%.1f KB", Double(bytes) / 1024.0)
+        } else if bytes < 1024 * 1024 * 1024 {
+            return String(format: "%.1f MB", Double(bytes) / (1024.0 * 1024.0))
+        } else {
+            return String(format: "%.1f GB", Double(bytes) / (1024.0 * 1024.0 * 1024.0))
+        }
     }
 
     private func serializeHTTPRequest(_ request: HTTPRequest) -> String {
@@ -196,6 +311,83 @@ class VirtualHostServer {
         _ = responseData.withUnsafeBytes { bytes in
             send(socket, bytes.bindMemory(to: UInt8.self).baseAddress, responseData.count, 0)
         }
+    }
+
+    private func discoverService(for hostname: String) -> DiscoveredService? {
+        // Extract service name from hostname (e.g., "webdav" from "webdav.local")
+        let serviceName = hostname.replacingOccurrences(of: ".local", with: "")
+                                   .replacingOccurrences(of: ".zilogo.com", with: "")
+                                   .components(separatedBy: ".").first ?? ""
+
+        if serviceName.isEmpty {
+            return nil
+        }
+
+        // Query mDNS for service type
+        let serviceType = "_\(serviceName)._tcp"
+        display.log("Discovering \(serviceType) for \(hostname)...", icon: "🔍", fallback: "[DISCOVER]")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/timeout")
+        process.arguments = ["2", "/usr/bin/avahi-browse", "-r", "-t", "-p", serviceType]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let output = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+
+            // Parse avahi-browse output
+            // Format: =;interface;protocol;name;type;domain;hostname;address;port;txt...
+            for line in output.components(separatedBy: "\n") {
+                if line.hasPrefix("=") {
+                    let parts = line.components(separatedBy: ";")
+                    if parts.count >= 9 {
+                        let host = parts[7]
+                        let port = Int(parts[8]) ?? 0
+
+                        // Parse TXT records (all in parts[9] as quoted strings)
+                        var capabilities: [String: String] = [:]
+                        if parts.count > 9 && !parts[9].isEmpty {
+                            // TXT records are like: "key1=val1" "key2=val2"
+                            let txtField = parts[9]
+                            let txtRecords = txtField.components(separatedBy: "\" \"")
+                            for record in txtRecords {
+                                let cleaned = record.replacingOccurrences(of: "\"", with: "")
+                                let txtParts = cleaned.components(separatedBy: "=")
+                                if txtParts.count >= 2 {
+                                    let key = txtParts[0]
+                                    let value = txtParts[1...].joined(separator: "=")
+                                    capabilities[key] = value
+                                }
+                            }
+                        }
+
+                        display.log("Found \(serviceType) at \(host):\(port)", icon: "✅", fallback: "[FOUND]")
+
+                        return DiscoveredService(
+                            hostname: hostname,
+                            serviceType: serviceType,
+                            name: serviceName,
+                            host: host,
+                            port: port,
+                            lastSeen: Date(),
+                            capabilities: capabilities
+                        )
+                    }
+                }
+            }
+        } catch {
+            display.log("Discovery error: \(error)", icon: "⚠️", fallback: "[ERROR]")
+        }
+
+        return nil
     }
 
     private func parseHTTPRequest(_ request: String) -> HTTPRequest {
